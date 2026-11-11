@@ -1,0 +1,115 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# ///
+"""tvwall — show an image (or slideshow) full-screen on the Sony BRAVIA over ADB.
+
+  tvwall IMAGE|DIR [...]         push + show; several images (or a folder) cycle every --every s
+  tvwall --find                  print the TV's current IP
+  tvwall --every 20 a.png b.png  slideshow, Ctrl-C to stop
+"""
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+SERVICE = "_androidtvremote2._tcp"
+NAME = "BRAVIA VU3"
+CACHE = pathlib.Path.home() / ".cache" / "tvwall_ip"
+REMOTE_DIR = "/sdcard/Pictures"
+IMG_EXT = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def _dns_sd(args: list[str], secs: float = 3.0) -> str:
+    p = subprocess.Popen(["dns-sd", *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    time.sleep(secs)
+    p.terminate()
+    return p.communicate()[0] or ""
+
+
+def _port_open(ip: str) -> bool:
+    return subprocess.run(["nc", "-z", "-G", "1", ip, "5555"], capture_output=True).returncode == 0
+
+
+def find_ip() -> str:
+    if CACHE.exists():
+        ip = CACHE.read_text().strip()
+        if ip and _port_open(ip):
+            return ip
+    out = _dns_sd(["-L", NAME, SERVICE, "local"])
+    m = re.search(r"can be reached at (\S+?)\.?:\d+", out)
+    if not m:
+        sys.exit(f"tvwall: '{NAME}' not found via mDNS; is the TV on?")
+    out = _dns_sd(["-G", "v4", m.group(1)])
+    m = re.search(r"\b(\d+\.\d+\.\d+\.\d+)\b", out.split("Timestamp", 1)[-1])
+    if not m:
+        sys.exit("tvwall: could not resolve TV address")
+    ip = m.group(1)
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(ip)
+    return ip
+
+
+def adb(dev: str, *a: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["adb", "-s", dev, *a], capture_output=True, text=True)
+
+
+def show(dev: str, img: pathlib.Path) -> None:
+    remote = f"{REMOTE_DIR}/{img.name}"
+    adb(dev, "shell", "mkdir", "-p", REMOTE_DIR)
+    r = adb(dev, "push", str(img), remote)
+    if r.returncode:
+        sys.exit(f"tvwall: push failed: {r.stderr.strip()}")
+    adb(dev, "shell", "input keyevent KEYCODE_WAKEUP")
+    adb(dev, "shell", f"am start -a android.intent.action.VIEW -d file://{remote} -t image/* com.android.gallery3d")
+    print(f"showing {img.name}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("images", nargs="*", type=pathlib.Path)
+    ap.add_argument("--find", action="store_true")
+    ap.add_argument("--every", type=int, default=30, help="slideshow seconds per image")
+    args = ap.parse_args()
+
+    ip = find_ip()
+    if args.find:
+        print(ip)
+        return
+    if not args.images:
+        ap.error("give at least one image")
+    images: list[pathlib.Path] = []
+    for i in args.images:
+        if i.is_dir():
+            images += sorted(p for p in i.iterdir() if p.suffix.lower() in IMG_EXT)
+        elif i.is_file():
+            images.append(i)
+        else:
+            sys.exit(f"tvwall: no such file: {i}")
+    if not images:
+        sys.exit("tvwall: no images found")
+    args.images = images
+
+    dev = f"{ip}:5555"
+    subprocess.run(["adb", "connect", dev], capture_output=True)
+    if "device" not in adb(dev, "get-state").stdout:
+        sys.exit("tvwall: ADB not authorized; accept the prompt on the TV")
+
+    if len(args.images) == 1:
+        show(dev, args.images[0])
+        return
+    try:
+        while True:
+            for img in args.images:
+                show(dev, img)
+                time.sleep(args.every)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

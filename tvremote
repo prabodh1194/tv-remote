@@ -1,0 +1,526 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["pillow"]
+# ///
+"""tvremote — phone-friendly web remote for the Sony BRAVIA (wallpapers, slideshow, apps, keys).
+
+  tvremote                 serve on :8765, print the iPhone URL (token required)
+  tvremote --dir DIR       image folder (default: iCloud wallpaper/diwali/4k)
+  tvremote --port 9000
+
+On the iPhone: open the URL in Safari -> Share -> Add to Home Screen.
+Reuses bin/tvwall for TV discovery (mDNS) and image push.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import re
+import secrets
+import shlex
+import socket
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, unquote, urlparse
+
+HERE = pathlib.Path(__file__).resolve().parent
+_loader = importlib.machinery.SourceFileLoader("tvwall", str(HERE / "tvwall"))
+_spec = importlib.util.spec_from_loader("tvwall", _loader)
+tvwall = importlib.util.module_from_spec(_spec)
+_loader.exec_module(tvwall)
+
+DEFAULT_DIR = pathlib.Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/wallpaper/diwali/4k"
+CACHE = pathlib.Path.home() / ".cache" / "tvremote"
+THUMBS = CACHE / "thumbs"
+TOKEN_FILE = CACHE / "token"
+IMG_EXT = {".png", ".jpg", ".jpeg", ".webp"}
+
+KEYS = {
+    "up": 19, "down": 20, "left": 21, "right": 22, "ok": 23, "back": 4, "home": 3, "menu": 82,
+    "playpause": 85, "volup": 24, "voldown": 25, "mute": 164, "wake": 224, "sleep": 223,
+    "rewind": 89, "forward": 90,
+}
+# key -> (label, android package). Installed state is read from the TV.
+APPS = {
+    "netflix": ("Netflix", "com.netflix.ninja"),
+    "prime": ("Prime Video", "com.amazon.amazonvideo.livingroom"),
+    "hotstar": ("JioHotstar", "in.startv.hotstar"),
+    "youtube": ("YouTube", "com.google.android.youtube.tv"),
+    "appletv": ("Apple TV", "com.apple.atve.androidtv.appletv"),
+    "zee5": ("ZEE5", "com.graymatrix.did"),
+    "plex": ("Plex", "com.plexapp.android"),
+    "jellyfin": ("Jellyfin", "dev.jdtech.jellyfin"),
+    "googletv": ("Google TV", "com.google.android.videos"),
+    "projectivy": ("Home", "com.spocky.projengmenu"),
+}
+# TMDB watch-provider ids (region IN) -> app key
+PROVIDERS = {"netflix": 8, "prime": 119, "hotstar": 122, "appletv": 350, "zee5": 232}
+PROVIDER_BY_ID = {v: k for k, v in PROVIDERS.items()}
+REGION = "IN"
+TMDB_FILE = CACHE / "tmdb"       # one line: v3 api key or v4 read token
+PLEX_FILE = CACHE / "plex.json"  # {"url": "http://host:32400", "token": "..."}
+YT_RE = re.compile(r"^https://(www\.|m\.|music\.)?(youtube\.com|youtu\.be)/\S+$")
+LINK_RE = re.compile(r"^(https?|[a-z][a-z0-9+.-]*)://\S+$", re.I)
+# link host suffix -> app key (package pinned so the browser stub does not catch the link)
+LINK_HOSTS = {"zee5.com": "zee5", "youtube.com": "youtube", "youtu.be": "youtube", "netflix.com": "netflix",
+              "primevideo.com": "prime", "amazon.in": "prime", "amazon.com": "prime", "hotstar.com": "hotstar",
+              "jiohotstar.com": "hotstar", "tv.apple.com": "appletv", "jellyfin.org": "jellyfin"}
+
+
+def open_link(url: str) -> str:
+    """Open any link on the TV, in the app that owns it. Returns the app key ('' if the OS picked)."""
+    if not LINK_RE.match(url):
+        raise ValueError("not a link")
+    host = (urlparse(url).hostname or "").lower()
+    key = next((k for h, k in LINK_HOSTS.items() if host == h or host.endswith("." + h)), "")
+    if host.endswith("amazon.in") or host.endswith("amazon.com"):
+        key = key if "/gp/video" in url or "/dp/" in url else ""
+    pkg = APPS[key][1] if key in APPS else ""
+    FAST.send("input keyevent 224")
+    if pkg:
+        adb_shell(f"pm enable {pkg} >/dev/null 2>&1; am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d {shlex.quote(url)} -p {pkg}")
+    else:
+        adb_shell(f"am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d {shlex.quote(url)}")
+    return key
+
+IMAGES_DIR = DEFAULT_DIR
+_dev_lock = threading.Lock()
+_dev = {"id": None, "at": 0.0}
+
+
+def get_token() -> str:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    if TOKEN_FILE.exists():
+        return TOKEN_FILE.read_text().strip()
+    t = secrets.token_urlsafe(16)
+    TOKEN_FILE.write_text(t)
+    TOKEN_FILE.chmod(0o600)
+    return t
+
+
+def device(fresh: bool = False) -> str:
+    with _dev_lock:
+        if fresh or not _dev["id"] or time.time() - _dev["at"] > 30:
+            ip = tvwall.find_ip()
+            d = f"{ip}:5555"
+            subprocess.run(["adb", "connect", d], capture_output=True)
+            _dev.update(id=d, at=time.time())
+        return _dev["id"]
+
+
+def adb_shell(cmd: str) -> str:
+    for fresh in (False, True):
+        r = tvwall.adb(device(fresh), "shell", cmd)
+        if r.returncode == 0:
+            return r.stdout
+    raise RuntimeError(r.stderr.strip() or "adb failed")
+
+
+class FastShell:
+    """One long-lived `adb shell`; key presses are written to its stdin (no per-press adb spawn)."""
+
+    def __init__(self) -> None:
+        self.p: subprocess.Popen | None = None
+        self.dev = ""
+        self.lock = threading.Lock()
+
+    def send(self, cmd: str) -> None:
+        with self.lock:
+            for attempt in (0, 1):
+                d = device(fresh=bool(attempt))
+                if not self.p or self.p.poll() is not None or self.dev != d:
+                    if self.p:
+                        self.p.kill()
+                    self.p = subprocess.Popen(["adb", "-s", d, "shell"], stdin=subprocess.PIPE,
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                    self.dev = d
+                try:
+                    self.p.stdin.write(cmd + "\n")
+                    self.p.stdin.flush()
+                    return
+                except (BrokenPipeError, OSError):
+                    self.p = None
+            raise RuntimeError("TV unreachable")
+
+
+FAST = FastShell()
+_installed = {"at": 0.0, "pk": set()}
+
+
+def installed() -> set[str]:
+    if time.time() - _installed["at"] > 300:
+        out = adb_shell("pm list packages")
+        _installed.update(at=time.time(), pk={l.split(":", 1)[1].strip() for l in out.splitlines() if ":" in l})
+    return _installed["pk"]
+
+
+def launch(app: str) -> None:
+    label, pkg = APPS[app]
+    if pkg not in installed():
+        raise ValueError(f"{label} is not installed on the TV")
+    FAST.send("input keyevent 224")
+    out = adb_shell(f"monkey -p {pkg} -c android.intent.category.LEANBACK_LAUNCHER 1")
+    if "No activities found" in out:
+        adb_shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")
+
+
+# ---- movie discovery (TMDB) ----
+_tmdb_cache: dict[str, tuple[float, object]] = {}
+
+
+def tmdb_cfg() -> str:
+    import os
+    k = os.environ.get("TMDB_API_KEY", "").strip()
+    return k or (TMDB_FILE.read_text().strip() if TMDB_FILE.exists() else "")
+
+
+def tmdb(path: str, **params) -> dict:
+    import urllib.parse
+    import urllib.request
+    key = tmdb_cfg()
+    if not key:
+        raise ValueError("TMDB key not set: put it in ~/.cache/tvremote/tmdb")
+    hdr = {"Accept": "application/json"}
+    if len(key) > 40:
+        hdr["Authorization"] = f"Bearer {key}"
+    else:
+        params["api_key"] = key
+    url = f"https://api.themoviedb.org/3{path}?{urllib.parse.urlencode(params)}"
+    hit = _tmdb_cache.get(url)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    with urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=10) as r:
+        data = json.load(r)
+    _tmdb_cache[url] = (time.time(), data)
+    return data
+
+
+def _movie(m: dict, providers: list[str]) -> dict:
+    return {
+        "id": m["id"], "title": m.get("title", ""), "year": (m.get("release_date") or "")[:4],
+        "rating": round(m.get("vote_average") or 0, 1), "overview": m.get("overview", ""),
+        "poster": f"https://image.tmdb.org/t/p/w342{m['poster_path']}" if m.get("poster_path") else "",
+        "providers": providers, "src": "tmdb",
+    }
+
+
+def providers_for(mid: int) -> list[str]:
+    try:
+        flat = tmdb(f"/movie/{mid}/watch/providers").get("results", {}).get(REGION, {}).get("flatrate", [])
+    except Exception:
+        return []
+    return [PROVIDER_BY_ID[p["provider_id"]] for p in flat if p["provider_id"] in PROVIDER_BY_ID]
+
+
+def discover(provider: str, q: str, sort: str, page: int) -> list[dict]:
+    from concurrent.futures import ThreadPoolExecutor
+    if q:
+        res = tmdb("/search/movie", query=q, page=page, region=REGION).get("results", [])[:18]
+        with ThreadPoolExecutor(8) as ex:
+            provs = list(ex.map(lambda m: providers_for(m["id"]), res))
+        out = [_movie(m, p) for m, p in zip(res, provs)]
+        return [m for m in out if provider == "all" or provider in m["providers"]]
+    sort_by = {"popular": "popularity.desc", "rating": "vote_average.desc", "new": "primary_release_date.desc"}.get(sort, "popularity.desc")
+    base = dict(watch_region=REGION, with_watch_monetization_types="flatrate", sort_by=sort_by, page=page)
+    if sort == "rating":
+        base["vote_count.gte"] = 300
+    if sort == "new":
+        base["primary_release_date.lte"] = time.strftime("%Y-%m-%d")
+        base["vote_count.gte"] = 20
+    wanted = list(PROVIDERS) if provider == "all" else [provider]
+    seen: dict[int, dict] = {}
+    for key in wanted:
+        for m in tmdb("/discover/movie", with_watch_providers=PROVIDERS[key], **base).get("results", [])[:20]:
+            seen.setdefault(m["id"], _movie(m, []))["providers"].append(key)
+    out = list(seen.values())
+    out.sort(key=lambda m: (-len(m["providers"]), -m["rating"]) if sort == "rating" else 0)
+    return out[:40]
+
+
+# ---- Plex library (optional; needs ~/.cache/tvremote/plex.json) ----
+def plex_cfg() -> dict | None:
+    try:
+        c = json.loads(PLEX_FILE.read_text())
+        return c if c.get("url") and c.get("token") else None
+    except (OSError, ValueError):
+        return None
+
+
+def plex_get(path: str, **params) -> dict:
+    import urllib.parse
+    import urllib.request
+    c = plex_cfg()
+    if not c:
+        raise ValueError("Plex not configured: write {url, token} to ~/.cache/tvremote/plex.json")
+    params["X-Plex-Token"] = c["token"]
+    req = urllib.request.Request(f"{c['url'].rstrip('/')}{path}?{urllib.parse.urlencode(params)}", headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)
+
+
+def plex_items(q: str) -> list[dict]:
+    if q:
+        hubs = plex_get("/hubs/search", query=q, limit=12).get("MediaContainer", {}).get("Hub", [])
+        meta = [m for h in hubs if h.get("type") == "movie" for m in h.get("Metadata", [])]
+    else:
+        meta = plex_get("/library/recentlyAdded", **{"X-Plex-Container-Size": 30}).get("MediaContainer", {}).get("Metadata", [])
+        meta = [m for m in meta if m.get("type") == "movie"]
+    return [{"id": m["ratingKey"], "title": m.get("title", ""), "year": str(m.get("year", "")), "rating": round(m.get("rating") or 0, 1),
+             "overview": m.get("summary", ""), "poster": f"/plexthumb?p={m.get('thumb', '')}", "providers": ["plex"], "src": "plex"} for m in meta]
+
+
+def images() -> list[pathlib.Path]:
+    if not IMAGES_DIR.is_dir():
+        return []
+    try:
+        return sorted(p for p in IMAGES_DIR.iterdir() if p.suffix.lower() in IMG_EXT and not p.name.startswith("."))
+    except PermissionError:  # macOS privacy blocks iCloud Drive for this process
+        return []
+
+
+def find_image(name: str) -> pathlib.Path | None:
+    return next((p for p in images() if p.name == name), None)
+
+
+# ---- slideshow (runs in-process; stop event ends it) ----
+class Slideshow:
+    def __init__(self) -> None:
+        self.stop_ev = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.every = 20
+        self.current = ""
+
+    @property
+    def running(self) -> bool:
+        return bool(self.thread and self.thread.is_alive() and not self.stop_ev.is_set())
+
+    def start(self, every: int, names: list[str] | None) -> None:
+        self.stop()
+        self.every = max(5, min(every, 600))
+        self.stop_ev = threading.Event()
+        ev = self.stop_ev
+        sel = [p for p in images() if not names or p.name in names]
+
+        def loop() -> None:
+            while not ev.is_set() and sel:
+                for p in sel:
+                    if ev.is_set():
+                        return
+                    try:
+                        self.current = p.name
+                        tvwall.show(device(), p)
+                    except BaseException:  # tvwall.show exits on push failure; keep looping
+                        pass
+                    ev.wait(self.every)
+
+        self.thread = threading.Thread(target=loop, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_ev.set()
+
+
+SHOW = Slideshow()
+
+
+def thumb(path: pathlib.Path) -> pathlib.Path:
+    from PIL import Image
+
+    THUMBS.mkdir(parents=True, exist_ok=True)
+    out = THUMBS / f"{path.stem}.{int(path.stat().st_mtime)}.jpg"
+    if not out.exists():
+        im = Image.open(path).convert("RGB")
+        im.thumbnail((640, 360))
+        tmp = out.with_suffix(".tmp")
+        im.save(tmp, "JPEG", quality=82)
+        tmp.rename(out)
+    return out
+
+
+_icon: list[bytes] = []
+
+
+def icon_png() -> bytes:
+    """180x180 home-screen icon (iOS ignores SVG): a lit diya on dark violet."""
+    if not _icon:
+        import io
+
+        from PIL import Image, ImageDraw
+        S = 4 * 180
+        im = Image.new("RGB", (S, S), (20, 9, 31))
+        d = ImageDraw.Draw(im)
+        cx, y = S // 2, int(S * .66)
+        d.ellipse([cx - 300, y - 340, cx + 300, y + 260], fill=(60, 30, 20))
+        d.pieslice([cx - 270, y - 150, cx + 270, y + 240], 0, 180, fill=(184, 80, 28))
+        d.pieslice([cx - 215, y - 105, cx + 215, y + 150], 0, 180, fill=(224, 122, 40))
+        d.ellipse([cx - 270, y - 40, cx + 270, y + 26], fill=(240, 150, 50))
+        d.polygon([(cx, y - 470), (cx + 80, y - 190), (cx, y - 70), (cx - 80, y - 190)], fill=(255, 205, 70))
+        d.polygon([(cx, y - 330), (cx + 34, y - 180), (cx, y - 110), (cx - 34, y - 180)], fill=(255, 250, 220))
+        buf = io.BytesIO()
+        im.resize((180, 180), Image.LANCZOS).save(buf, "PNG")
+        _icon.append(buf.getvalue())
+    return _icon[0]
+
+
+class H(BaseHTTPRequestHandler):
+    token = ""
+    page = HERE / "tvremote.html"
+
+    def log_message(self, *a) -> None:
+        pass
+
+    def _send(self, code: int, body: bytes, ctype: str = "application/json", extra: dict | None = None) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store" if ctype != "image/jpeg" else "max-age=86400")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, code: int, obj: dict) -> None:
+        self._send(code, json.dumps(obj).encode())
+
+    def _authed(self, qs: dict) -> bool:
+        t = (qs.get("t") or [""])[0] or self.headers.get("X-Token", "")
+        return secrets.compare_digest(t, self.token)
+
+    def do_GET(self) -> None:
+        u = urlparse(self.path)
+        qs = parse_qs(u.query)
+        if u.path == "/":
+            return self._send(200, self.page.read_bytes(), "text/html; charset=utf-8")
+        if u.path == "/icon.png":
+            return self._send(200, icon_png(), "image/png", {"Cache-Control": "max-age=86400"})
+        if not self._authed(qs):
+            return self._json(401, {"error": "bad token"})
+        if u.path == "/api/state":
+            try:
+                have = installed()
+            except Exception:
+                have = set()
+            return self._json(200, {
+                "images": [p.name for p in images()],
+                "slideshow": SHOW.running, "every": SHOW.every, "current": SHOW.current,
+                "apps": [{"key": k, "label": l, "installed": p in have} for k, (l, p) in APPS.items()],
+                "tmdb": bool(tmdb_cfg()), "plex": bool(plex_cfg()), "providers": list(PROVIDERS),
+            })
+        if u.path == "/api/discover":
+            g = lambda k, d="": (qs.get(k) or [d])[0]
+            try:
+                if g("provider") == "plex":
+                    items = plex_items(g("q"))
+                else:
+                    items = discover(g("provider", "all"), g("q"), g("sort", "popular"), int(g("page", "1")))
+                return self._json(200, {"items": items})
+            except Exception as e:
+                return self._json(502, {"error": str(e)})
+        if u.path == "/plexthumb":
+            try:
+                import urllib.request
+                c = plex_cfg()
+                if not c:
+                    raise ValueError("Plex not configured")
+                p = (qs.get("p") or [""])[0]
+                if not p.startswith("/"):
+                    raise ValueError("bad path")
+                with urllib.request.urlopen(f"{c['url'].rstrip('/')}{p}?X-Plex-Token={c['token']}", timeout=10) as r:
+                    return self._send(200, r.read(), "image/jpeg")
+            except Exception as e:
+                return self._json(502, {"error": str(e)})
+        if u.path.startswith("/thumb/"):
+            p = find_image(unquote(u.path[len("/thumb/"):]))
+            if not p:
+                return self._json(404, {"error": "no such image"})
+            return self._send(200, thumb(p).read_bytes(), "image/jpeg")
+        self._json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        u = urlparse(self.path)
+        if not self._authed(parse_qs(u.query)):
+            return self._json(401, {"error": "bad token"})
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            self._json(200, self.route(u.path, body))
+        except (ValueError, KeyError) as e:
+            self._json(400, {"error": str(e)})
+        except Exception as e:
+            self._json(502, {"error": str(e)})
+
+    def route(self, path: str, b: dict) -> dict:
+        if path == "/api/key":
+            FAST.send(f"input keyevent {KEYS[b['key']]}")
+            return {"ok": True}
+        if path == "/api/app":
+            SHOW.stop()
+            launch(b["app"])
+            return {"ok": True}
+        if path == "/api/stayawake":
+            on = bool(b["on"])
+            adb_shell(f"settings put global stay_on_while_plugged_in {7 if on else 0}; settings put system screen_off_timeout {2147483647 if on else 600000}")
+            return {"ok": True}
+        if path in ("/api/open", "/api/youtube"):
+            url = str(b["url"]).strip()
+            SHOW.stop()
+            return {"ok": True, "app": open_link(url)}
+        if path == "/api/show":
+            p = find_image(str(b["name"]))
+            if not p:
+                raise ValueError("no such image")
+            SHOW.stop()
+            tvwall.show(device(), p)
+            return {"ok": True}
+        if path == "/api/slideshow":
+            if b["action"] == "start":
+                SHOW.start(int(b.get("every", 20)), b.get("names"))
+            else:
+                SHOW.stop()
+            return {"ok": True, "slideshow": SHOW.running}
+        raise ValueError("unknown endpoint")
+
+
+def lan_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def main() -> None:
+    global IMAGES_DIR
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dir", type=pathlib.Path, default=DEFAULT_DIR)
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--name", default="tv", help="Bonjour hostname -> <name>.local ('' to disable)")
+    a = ap.parse_args()
+    IMAGES_DIR = a.dir
+    H.token = get_token()
+    host = subprocess.run(["scutil", "--get", "LocalHostName"], capture_output=True, text=True).stdout.strip()
+    print(f"images: {IMAGES_DIR} ({len(images())})", flush=True)
+    print(f"open on iPhone (same Wi-Fi):\n  http://{lan_ip()}:{a.port}/?t={H.token}", flush=True)
+    if host:
+        print(f"  http://{host}.local:{a.port}/?t={H.token}", flush=True)
+    if a.name:
+        # Bonjour alias: <name>.local -> this Mac, so the link survives IP changes. Dies with the server.
+        subprocess.Popen(["dns-sd", "-P", "TV Remote", "_http._tcp", "local", str(a.port), f"{a.name}.local", lan_ip()],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"  http://{a.name}.local:{a.port}/?t={H.token}   <- named link", flush=True)
+    threading.Thread(target=lambda: [thumb(p) for p in images()], daemon=True).start()
+    threading.Thread(target=lambda: device() and installed(), daemon=True).start()
+    ThreadingHTTPServer(("0.0.0.0", a.port), H).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

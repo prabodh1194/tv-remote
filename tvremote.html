@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TV Remote</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="TV Remote">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#14091f">
+<link rel="apple-touch-icon" href="/icon.png">
+<style>
+  :root {
+    --bg: #14091f; --card: #211033; --card2: #2c1745; --line: #3a2358;
+    --text: #fbeede; --muted: #b9a5cf; --accent: #ffb703; --accent-ink: #2a1400; --bad: #ff6b6b;
+    --r: 18px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 16px/1.4 -apple-system, system-ui, "SF Pro Text", Roboto, sans-serif;
+    padding: calc(env(safe-area-inset-top) + 14px) max(16px, env(safe-area-inset-right)) calc(env(safe-area-inset-bottom) + 28px) max(16px, env(safe-area-inset-left));
+    max-width: 560px; margin: 0 auto;
+  }
+  h1 { font-size: 22px; margin: 4px 0 14px; letter-spacing: .2px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: var(--r); padding: 14px; margin-bottom: 14px; }
+  button {
+    font: inherit; color: var(--text); background: var(--card2); border: 1px solid var(--line);
+    border-radius: 14px; min-height: 52px; padding: 0 14px; cursor: pointer; touch-action: manipulation;
+    transition: transform .06s, background .15s;
+  }
+  button:active { transform: scale(.96); background: #3a2160; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 700; }
+  button.primary:active { background: #ffc83a; }
+  .row { display: flex; gap: 10px; }
+  .row > * { flex: 1; }
+  .seg { display: flex; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; min-height: 44px; background: transparent; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); font-weight: 700; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .tile { padding: 0; min-height: 0; overflow: hidden; text-align: left; position: relative; }
+  .tile img { display: block; width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #0c0414; }
+  .tile span { display: block; padding: 6px 8px 8px; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile.live { outline: 3px solid var(--accent); }
+  .dpad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; max-width: 280px; margin: 0 auto 12px; }
+  .dpad button { min-height: 62px; font-size: 22px; }
+  .dpad .ok { background: var(--accent); color: var(--accent-ink); font-weight: 700; font-size: 16px; }
+  .spacer { visibility: hidden; }
+  .apps-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; }
+  .apps-grid button { font-weight: 700; min-height: 56px; font-size: 14px; padding: 0 6px; }
+  .apps-grid button:disabled { opacity: .35; }
+  .app-netflix { background: #b20710 !important; border-color: #b20710 !important; }
+  .app-youtube { background: #c00 !important; border-color: #c00 !important; }
+  .app-prime { background: #0a5a8a !important; border-color: #0a5a8a !important; }
+  .app-hotstar { background: #1b2a6b !important; border-color: #3550d0 !important; }
+  .app-plex { background: #b8860b !important; border-color: #e5a00d !important; color: #1a1000 !important; }
+  .app-appletv { background: #111 !important; }
+  .switch { display: flex; align-items: center; gap: 10px; margin-top: 14px; color: var(--muted); font-size: 14px; }
+  .switch input { width: 22px; height: 22px; accent-color: var(--accent); }
+  input[type=search] { width: 100%; min-height: 48px; border-radius: 14px; border: 1px solid var(--line); background: #150a22; color: var(--text); padding: 0 14px; font: inherit; }
+  .chips { display: flex; gap: 8px; overflow-x: auto; padding: 10px 0 2px; scrollbar-width: none; }
+  .chips::-webkit-scrollbar { display: none; }
+  .chip { flex: none; min-height: 38px; border-radius: 999px; padding: 0 14px; font-size: 14px; }
+  .chip[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 700; }
+  .movies { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .movie { padding: 0; min-height: 0; overflow: hidden; text-align: left; position: relative; }
+  .movie img { display: block; width: 100%; aspect-ratio: 2/3; object-fit: cover; background: #0c0414; }
+  .movie .m { display: block; padding: 5px 6px 7px; font-size: 11.5px; line-height: 1.25; }
+  .movie .m b { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .movie .m i { font-style: normal; color: var(--muted); }
+  .movie .badge { position: absolute; top: 5px; left: 5px; right: 5px; display: flex; gap: 3px; flex-wrap: wrap; pointer-events: none; }
+  .movie .badge u { text-decoration: none; background: #000b; border-radius: 6px; font-size: 10px; padding: 1px 5px; color: #fff; }
+  #sheet { position: fixed; inset: 0; z-index: 10; display: flex; align-items: flex-end; }
+  #sheet[hidden] { display: none; }
+  .sheet-bg { position: absolute; inset: 0; background: #000a; }
+  .sheet-body { position: relative; width: 100%; max-width: 560px; margin: 0 auto; background: var(--card); border-radius: 22px 22px 0 0; padding: 18px 16px calc(env(safe-area-inset-bottom) + 18px); max-height: 85vh; overflow: auto; }
+  .sheet-top { display: flex; gap: 14px; margin-bottom: 10px; }
+  .sheet-top img { width: 96px; border-radius: 10px; aspect-ratio: 2/3; object-fit: cover; background: #0c0414; }
+  .sheet-top h3 { margin: 0 0 4px; font-size: 19px; }
+  .over { color: var(--muted); font-size: 14px; margin: 6px 0 14px; }
+  .x { position: absolute; top: 10px; right: 10px; min-height: 36px; width: 36px; padding: 0; border-radius: 50%; }
+  input[type=url] {
+    width: 100%; min-height: 48px; border-radius: 14px; border: 1px solid var(--line); background: #150a22;
+    color: var(--text); padding: 0 14px; font: inherit; margin-bottom: 10px;
+  }
+  .status { font-size: 13px; color: var(--muted); margin: 8px 0 0; min-height: 18px; }
+  #toast {
+    position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 18px); transform: translate(-50%, 20px);
+    background: #000c; color: #fff; padding: 10px 16px; border-radius: 999px; font-size: 14px; opacity: 0;
+    transition: .2s; pointer-events: none; backdrop-filter: blur(8px); max-width: 90vw;
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+  #toast.err { background: var(--bad); color: #200; }
+  .gate { text-align: center; padding: 40px 10px; color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>🪔 TV Remote</h1>
+
+<div id="gate" class="gate" hidden>Open the full link printed by <code>tvremote</code> (it includes <code>?t=…</code>).</div>
+
+<div id="app" hidden>
+  <section>
+    <h2>Wallpaper slideshow</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button id="play" class="primary">▶ Start</button>
+      <button id="stop">⏸ Pause</button>
+    </div>
+    <div class="seg" id="every" role="group" aria-label="Seconds per image">
+      <button data-v="10">10s</button><button data-v="20">20s</button><button data-v="60">1 min</button><button data-v="300">5 min</button>
+    </div>
+    <p class="status" id="sstatus"></p>
+  </section>
+
+  <section>
+    <h2>Wallpapers</h2>
+    <div class="grid" id="grid"></div>
+  </section>
+
+  <section>
+    <h2>Remote</h2>
+    <div class="dpad">
+      <span class="spacer"></span><button data-k="up">▲</button><span class="spacer"></span>
+      <button data-k="left">◀</button><button data-k="ok" class="ok">OK</button><button data-k="right">▶</button>
+      <span class="spacer"></span><button data-k="down">▼</button><span class="spacer"></span>
+    </div>
+    <div class="row" style="margin-bottom:10px">
+      <button data-k="back">⮌ Back</button><button data-k="home">⌂ Home</button><button data-k="playpause">⏯</button>
+    </div>
+    <div class="row" style="margin-bottom:10px">
+      <button data-k="voldown">🔉 −</button><button data-k="mute">🔇</button><button data-k="volup">🔊 +</button>
+    </div>
+    <div class="row">
+      <button data-k="wake">⏻ Wake</button><button data-k="sleep">☾ Sleep</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Apps</h2>
+    <div class="apps-grid" id="apps"></div>
+    <input id="yt" type="url" inputmode="url" placeholder="Paste any link (ZEE5, YouTube, Hotstar, Prime…) to open on TV" autocapitalize="off" autocorrect="off">
+    <button id="ytgo" class="primary" style="width:100%">Open on TV</button>
+    <label class="switch"><input type="checkbox" id="stay"> Keep TV awake (never auto-sleep)</label>
+  </section>
+
+  <section>
+    <h2>Home-screen shortcuts</h2>
+    <p class="status" style="margin:0 0 10px">Tap one (it runs the action), then Share → Add to Home Screen to get its own icon.</p>
+    <div class="apps-grid" id="shortcuts"></div>
+  </section>
+
+  <section id="disc">
+    <h2>Find a movie</h2>
+    <input id="q" type="search" placeholder="Search movies on your apps…" autocapitalize="off" autocorrect="off" enterkeyhint="search">
+    <div class="chips" id="chips"></div>
+    <div class="seg" id="sort" role="group" aria-label="Sort" style="margin:10px 0">
+      <button data-v="popular" aria-pressed="true">Popular</button><button data-v="rating">Top rated</button><button data-v="new">New</button>
+    </div>
+    <p class="status" id="dstatus"></p>
+    <div class="movies" id="movies"></div>
+  </section>
+</div>
+
+<div id="sheet" hidden>
+  <div class="sheet-bg"></div>
+  <div class="sheet-body">
+    <button class="x" id="sx" aria-label="Close">✕</button>
+    <div class="sheet-top"><img id="sp" alt=""><div><h3 id="st"></h3><p class="status" id="sm"></p></div></div>
+    <p id="so" class="over"></p>
+    <h2>Open on TV</h2>
+    <div class="apps-grid" id="sa"></div>
+    <p class="status" id="sn"></p>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const qs = new URLSearchParams(location.search);
+let T = qs.get('t');
+// The token stays in the URL on purpose: "Add to Home Screen" saves the URL, and a home-screen app has its own storage.
+try { if (T) localStorage.setItem('tvt', T); else T = localStorage.getItem('tvt'); } catch (e) {}
+const $ = (s, r = document) => r.querySelector(s);
+const toastEl = $('#toast'); let tt;
+function toast(msg, err) {
+  toastEl.textContent = msg; toastEl.className = 'show' + (err ? ' err' : '');
+  clearTimeout(tt); tt = setTimeout(() => toastEl.className = '', err ? 3500 : 1600);
+}
+async function api(path, body) {
+  const r = await fetch(`/api/${path}?t=${encodeURIComponent(T)}`, body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+async function act(label, path, body) {
+  try { await api(path, body); if (label) toast(label); refresh(); }
+  catch (e) { toast(e.message, true); }
+}
+const label = n => n.replace(/^diwali_/, '').replace(/_\d+x\d+\.\w+$/, '').replace(/^\d+_/, '').replace(/_/g, ' ');
+
+let every = 20, names = [];
+function paintEvery() { document.querySelectorAll('#every button').forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.v === every))); }
+document.querySelectorAll('#every button').forEach(b => b.onclick = () => { every = +b.dataset.v; paintEvery(); if (running) start(); });
+let running = false;
+const start = () => act(`Slideshow every ${every}s`, 'slideshow', { action: 'start', every });
+$('#play').onclick = start;
+$('#stop').onclick = () => act('Paused', 'slideshow', { action: 'stop' });
+document.querySelectorAll('[data-k]').forEach(b => b.onclick = () => act('', 'key', { key: b.dataset.k }));
+let appList = [], provKeys = [], cfg = { tmdb: false, plex: false };
+function appBtn(a, extra) {
+  const b = document.createElement('button');
+  b.className = 'app-' + a.key; b.textContent = a.label; b.disabled = !a.installed;
+  if (!a.installed) b.title = 'Not installed on the TV';
+  b.onclick = () => { if (extra) extra(a); act('Opening ' + a.label, 'app', { app: a.key }); };
+  return b;
+}
+function paintApps(list) {
+  if (JSON.stringify(list) === JSON.stringify(appList)) return;
+  appList = list; const g = $('#apps'); g.innerHTML = '';
+  list.forEach(a => g.appendChild(appBtn(a)));
+}
+$('#stay').onchange = e => act(e.target.checked ? 'TV will stay awake' : 'Auto-sleep restored', 'stayawake', { on: e.target.checked });
+
+// ---- discover ----
+let dprov = 'all', dsort = 'popular', dtimer;
+const PL = { all: 'All apps', netflix: 'Netflix', prime: 'Prime', hotstar: 'JioHotstar', appletv: 'Apple TV', zee5: 'ZEE5', plex: 'Plex' };
+function paintChips() {
+  const keys = ['all', ...provKeys, ...(cfg.plex ? ['plex'] : [])];
+  $('#chips').innerHTML = '';
+  keys.forEach(k => {
+    const b = document.createElement('button'); b.className = 'chip'; b.textContent = PL[k] || k;
+    b.setAttribute('aria-pressed', String(k === dprov));
+    b.onclick = () => { dprov = k; paintChips(); loadMovies(); };
+    $('#chips').appendChild(b);
+  });
+}
+document.querySelectorAll('#sort button').forEach(b => b.onclick = () => {
+  dsort = b.dataset.v; document.querySelectorAll('#sort button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); loadMovies();
+});
+$('#q').oninput = () => { clearTimeout(dtimer); dtimer = setTimeout(loadMovies, 450); };
+const src = u => u.startsWith('/') ? `${u}&t=${encodeURIComponent(T)}` : u;
+let reqId = 0;
+async function loadMovies() {
+  if (!cfg.tmdb && dprov !== 'plex') { $('#dstatus').textContent = 'Add a free TMDB key to ~/.cache/tvremote/tmdb to enable movie discovery.'; $('#movies').innerHTML = ''; return; }
+  const my = ++reqId, q = $('#q').value.trim();
+  $('#dstatus').textContent = 'Loading…';
+  try {
+    const r = await fetch(`/api/discover?t=${encodeURIComponent(T)}&provider=${dprov}&sort=${dsort}&q=${encodeURIComponent(q)}`);
+    const j = await r.json(); if (my !== reqId) return;
+    if (!r.ok) throw new Error(j.error);
+    $('#dstatus').textContent = j.items.length ? '' : 'Nothing found on your apps.';
+    const g = $('#movies'); g.innerHTML = '';
+    j.items.forEach(m => {
+      const b = document.createElement('button'); b.className = 'movie';
+      b.innerHTML = `<img loading="lazy" alt="" src="${src(m.poster)}"><span class="badge">${m.providers.map(p => `<u>${PL[p] || p}</u>`).join('')}</span><span class="m"><b></b><i>${m.year}${m.rating ? ' · ★' + m.rating : ''}</i></span>`;
+      b.querySelector('b').textContent = m.title;
+      b.onclick = () => openSheet(m); g.appendChild(b);
+    });
+  } catch (e) { if (my === reqId) $('#dstatus').textContent = e.message; }
+}
+function openSheet(m) {
+  $('#sp').src = src(m.poster); $('#st').textContent = m.title;
+  $('#sm').textContent = `${m.year}${m.rating ? ' · ★' + m.rating : ''}`; $('#so').textContent = m.overview;
+  const g = $('#sa'); g.innerHTML = '';
+  const keys = m.providers.length ? m.providers : [];
+  keys.forEach(k => { const a = appList.find(x => x.key === k); if (a) g.appendChild(appBtn(a, () => { $('#sheet').hidden = true; })); });
+  $('#sn').textContent = keys.length
+    ? `Opens the app on the TV. Search for “${m.title}” there; apps don't accept a title from here.`
+    : 'Not streaming on your apps in India right now.';
+  $('#sheet').hidden = false;
+}
+$('#sx').onclick = () => $('#sheet').hidden = true;
+document.querySelector('.sheet-bg').onclick = () => $('#sheet').hidden = true;
+$('#ytgo').onclick = () => { const url = $('#yt').value.trim(); if (url) act('Opening on TV', 'open', { url }); };
+
+function paintGrid(s) {
+  const g = $('#grid');
+  if (JSON.stringify(names) !== JSON.stringify(s.images)) {
+    names = s.images; g.innerHTML = '';
+    names.forEach(n => {
+      const b = document.createElement('button'); b.className = 'tile'; b.dataset.n = n;
+      b.innerHTML = `<img loading="lazy" alt="" src="/thumb/${encodeURIComponent(n)}?t=${encodeURIComponent(T)}"><span>${label(n)}</span>`;
+      b.onclick = () => act('Showing ' + label(n), 'show', { name: n });
+      g.appendChild(b);
+    });
+  }
+  g.querySelectorAll('.tile').forEach(b => b.classList.toggle('live', s.slideshow && b.dataset.n === s.current));
+}
+async function refresh() {
+  try {
+    const s = await api('state');
+    running = s.slideshow;
+    if (running) { every = s.every; paintEvery(); }
+    paintGrid(s); paintApps(s.apps);
+    if (!provKeys.length || cfg.tmdb !== s.tmdb || cfg.plex !== s.plex) {
+      const first = !provKeys.length; provKeys = s.providers; cfg = { tmdb: s.tmdb, plex: s.plex }; paintChips(); if (first || true) loadMovies();
+    }
+    $('#sstatus').textContent = running ? `Running · every ${s.every}s · ${label(s.current || '')}` : 'Paused';
+  } catch (e) { $('#sstatus').textContent = 'Cannot reach the Mac'; }
+}
+// ?do=slideshow | pause | app:<key> | key:<k> runs once on load (this is what a home-screen shortcut icon points at).
+const SHORTCUTS = [['Slideshow', 'slideshow'], ['Pause', 'pause'], ['Wake TV', 'key:wake'], ['Sleep TV', 'key:sleep'], ['Mute', 'key:mute'],
+  ['Netflix', 'app:netflix'], ['Prime', 'app:prime'], ['JioHotstar', 'app:hotstar'], ['YouTube', 'app:youtube'], ['Apple TV', 'app:appletv']];
+function paintShortcuts() {
+  const g = $('#shortcuts'); g.innerHTML = '';
+  SHORTCUTS.forEach(([name, d]) => {
+    const a = document.createElement('a'); a.href = `/?t=${encodeURIComponent(T)}&do=${encodeURIComponent(d)}`;
+    const b = document.createElement('button'); b.textContent = name; b.style.width = '100%';
+    a.appendChild(b); a.style.textDecoration = 'none'; g.appendChild(a);
+  });
+}
+async function runDo(d) {
+  const [kind, arg] = d.split(':');
+  if (kind === 'slideshow') return act('Slideshow started', 'slideshow', { action: 'start', every });
+  if (kind === 'pause') return act('Paused', 'slideshow', { action: 'stop' });
+  if (kind === 'app') return act('Opening ' + arg, 'app', { app: arg });
+  if (kind === 'key') return act('', 'key', { key: arg });
+}
+if (!T) { $('#gate').hidden = false; } else {
+  $('#app').hidden = false; paintEvery(); paintShortcuts(); refresh(); setInterval(refresh, 5000);
+  const d = qs.get('do'); if (d) runDo(d);
+}
+</script>
+</body>
+</html>
